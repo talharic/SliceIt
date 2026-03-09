@@ -4,21 +4,23 @@ public class SliceManager : MonoBehaviour
 {
     [SerializeField] private LineRenderer cutLineRenderer;
 
-    private const float LINE_FADE_DURATION = 0.5f;
-    private const float LINE_WIDTH = 0.05f;
-    private static readonly Color LineColor = new(1f, 1f, 1f, 0.8f);
+    private const float LineFadeDuration = 0.5f;
+    private const float LineWidthStart = 0.03f;
+    private const float LineWidthEnd = 0.06f;
+    private const float TargetRatio = 0.5f;
+    private const float OnTargetThreshold = 0.15f;
+
+    private static readonly Color DefaultLineColor = new(1f, 1f, 1f, 0.9f);
+    private static readonly Color OnTargetLineColor = new(1f, 0.843f, 0f, 0.95f);
 
     private Camera mainCamera;
+    private ScoreDisplay scoreDisplay;
+    private LevelManager levelManager;
     private Vector3 startPosition;
     private bool isCutting;
     private float lineDisappearTimer;
 
     private enum InputPhase { None, Began, Moved, Ended }
-
-    private void Awake()
-    {
-        Debug.Log("[SliceManager] Awake called");
-    }
 
     private void Start()
     {
@@ -37,7 +39,9 @@ public class SliceManager : MonoBehaviour
             return;
         }
 
-        Debug.Log($"[SliceManager] Initialized — Camera: {mainCamera.name}, LineRenderer: {cutLineRenderer.name}");
+        scoreDisplay = FindAnyObjectByType<ScoreDisplay>();
+        levelManager = FindAnyObjectByType<LevelManager>();
+
         InitializeLineRenderer();
     }
 
@@ -49,11 +53,11 @@ public class SliceManager : MonoBehaviour
 
     private void InitializeLineRenderer()
     {
-        cutLineRenderer.startWidth = LINE_WIDTH;
-        cutLineRenderer.endWidth = LINE_WIDTH;
+        cutLineRenderer.startWidth = LineWidthStart;
+        cutLineRenderer.endWidth = LineWidthEnd;
         cutLineRenderer.positionCount = 2;
-        cutLineRenderer.startColor = LineColor;
-        cutLineRenderer.endColor = LineColor;
+        cutLineRenderer.startColor = DefaultLineColor;
+        cutLineRenderer.endColor = DefaultLineColor;
         cutLineRenderer.enabled = false;
     }
 
@@ -84,7 +88,7 @@ public class SliceManager : MonoBehaviour
         return TryGetMouseInput(out position, out phase);
     }
 
-    private bool TryGetTouchInput(out Vector2 position, out InputPhase phase)
+    private static bool TryGetTouchInput(out Vector2 position, out InputPhase phase)
     {
         Touch touch = Input.GetTouch(0);
         position = touch.position;
@@ -98,7 +102,7 @@ public class SliceManager : MonoBehaviour
         return phase != InputPhase.None;
     }
 
-    private bool TryGetMouseInput(out Vector2 position, out InputPhase phase)
+    private static bool TryGetMouseInput(out Vector2 position, out InputPhase phase)
     {
         position = Input.mousePosition;
 
@@ -124,13 +128,14 @@ public class SliceManager : MonoBehaviour
         cutLineRenderer.enabled = true;
         cutLineRenderer.SetPosition(0, startPosition);
         cutLineRenderer.SetPosition(1, startPosition);
-        Debug.Log($"[SliceManager] Mouse Down at screen:{screenPosition} world:{startPosition}");
+        SetLineColor(DefaultLineColor);
     }
 
     private void UpdateCut(Vector2 screenPosition)
     {
         Vector3 worldPos = ScreenToWorldPosition(screenPosition);
         cutLineRenderer.SetPosition(1, worldPos);
+        UpdateLineColorByProximity(startPosition, worldPos);
     }
 
     private void EndCut(Vector2 screenPosition)
@@ -138,9 +143,49 @@ public class SliceManager : MonoBehaviour
         isCutting = false;
         Vector3 endPosition = ScreenToWorldPosition(screenPosition);
         cutLineRenderer.SetPosition(1, endPosition);
-        lineDisappearTimer = LINE_FADE_DURATION;
+        lineDisappearTimer = LineFadeDuration;
 
         TrySlice(startPosition, endPosition);
+    }
+
+    private void UpdateLineColorByProximity(Vector3 cutStart, Vector3 cutEnd)
+    {
+        var sliceable = FindActiveSliceable();
+        if (sliceable == null)
+        {
+            SetLineColor(DefaultLineColor);
+            return;
+        }
+
+        var targetLine = sliceable.GetComponent<TargetLineDisplay>();
+        if (targetLine == null)
+        {
+            SetLineColor(DefaultLineColor);
+            return;
+        }
+
+        Bounds bounds = sliceable.GetComponent<Renderer>().bounds;
+        float targetY = bounds.min.y + targetLine.TargetRatio * bounds.size.y;
+
+        Vector3 cutMidpoint = (cutStart + cutEnd) * 0.5f;
+        float normalizedDistance = Mathf.Abs(cutMidpoint.y - targetY) / bounds.size.y;
+
+        Color lineColor = normalizedDistance < OnTargetThreshold
+            ? Color.Lerp(OnTargetLineColor, DefaultLineColor, normalizedDistance / OnTargetThreshold)
+            : DefaultLineColor;
+
+        SetLineColor(lineColor);
+    }
+
+    private static SliceableObject FindActiveSliceable()
+    {
+        return Object.FindAnyObjectByType<SliceableObject>();
+    }
+
+    private void SetLineColor(Color color)
+    {
+        cutLineRenderer.startColor = color;
+        cutLineRenderer.endColor = color;
     }
 
     private void TrySlice(Vector3 cutStart, Vector3 cutEnd)
@@ -161,9 +206,64 @@ public class SliceManager : MonoBehaviour
             if (sliceable == null || !sliceable.CanBeSliced)
                 continue;
 
-            sliceable.Slice(cutStart, cutEnd);
+            Bounds objectBounds = hit.collider.bounds;
+            Vector3 cutNormal = Vector3.Cross((cutEnd - cutStart).normalized, Vector3.forward).normalized;
+            bool sliceSucceeded = sliceable.Slice(cutStart, cutEnd);
+
+            if (sliceSucceeded)
+            {
+                ScoreResult baseScore = ScoreCalculator.CalculateScore(
+                    cutStart, cutEnd, objectBounds, TargetRatio);
+                Vector3 scoreMidpoint = (cutStart + cutEnd) * 0.5f;
+
+                ScoreResult finalScore = ApplyComboMultiplier(baseScore);
+
+                scoreDisplay?.ShowScore(finalScore, scoreMidpoint);
+                levelManager?.OnSliceComplete(finalScore);
+
+                PlayMaterialEffects(sliceable, scoreMidpoint, cutNormal);
+
+                if (finalScore.Grade == ScoreGrade.Perfect)
+                    ScreenFlash.Instance?.PlayFlash();
+            }
+
             return;
         }
+    }
+
+    private static ScoreResult ApplyComboMultiplier(ScoreResult baseScore)
+    {
+        if (ComboSystem.Instance == null)
+            return baseScore;
+
+        float comboMultiplier = ComboSystem.Instance.RegisterCut(baseScore.Grade);
+        int comboPoints = Mathf.RoundToInt(baseScore.Points * comboMultiplier);
+
+        return new ScoreResult(
+            baseScore.ActualRatio,
+            baseScore.Deviation,
+            baseScore.Grade,
+            baseScore.Multiplier,
+            comboPoints);
+    }
+
+    private static void PlayMaterialEffects(SliceableObject sliceable, Vector3 position, Vector3 cutNormal)
+    {
+        MaterialData materialData = sliceable.CurrentMaterialData;
+
+        if (materialData != null)
+        {
+            SoundManager.Instance?.PlaySliceSound(materialData.Type);
+            SliceEffects.Instance?.PlaySliceEffect(
+                position, cutNormal, materialData.ParticleCount, materialData.ParticleColor);
+        }
+        else
+        {
+            SoundManager.Instance?.PlaySliceSound();
+            SliceEffects.Instance?.PlaySliceEffect(position, cutNormal);
+        }
+
+        HapticManager.Instance?.PlaySliceHaptic();
     }
 
     private void HandleLineFade()
